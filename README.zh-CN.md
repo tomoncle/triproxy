@@ -42,6 +42,23 @@ go build -o triproxy .
 
 检查服务：`curl http://localhost:8866/healthz`
 
+### Docker（快速开始）
+
+```bash
+docker run -d --name triproxy \
+  -p 8866:8866 \
+  -v /path/to/config.yaml:/etc/triproxy/config.yaml \
+  tomoncle/triproxy
+```
+
+容器读取 `/etc/triproxy/config.yaml`——用 `-v` 挂载你自己的配置替换内置示例，以非 root 用户运行并自带 `/healthz` 健康检查。追加参数可覆盖监听地址：
+
+```bash
+docker run -d -p 9000:9000 tomoncle/triproxy -listen :9000
+```
+
+> 完整 Docker 说明（docker-compose、标签、平台等）：[DOCKERHUB.md](DOCKERHUB.md)
+
 ## 配置参考
 
 配置文件为 YAML（JSON 也兼容，因为 JSON 是合法 YAML）。`listen` 缺省 `:8866`。

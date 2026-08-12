@@ -42,6 +42,23 @@ go build -o triproxy .
 
 Health check: `curl http://localhost:8866/healthz`
 
+### Docker (quick start)
+
+```bash
+docker run -d --name triproxy \
+  -p 8866:8866 \
+  -v /path/to/config.yaml:/etc/triproxy/config.yaml \
+  tomoncle/triproxy
+```
+
+The container reads `/etc/triproxy/config.yaml` — mount your own config to replace the bundled example — and runs as a non-root user with a built-in `/healthz` health check. Append arguments to override the listen address:
+
+```bash
+docker run -d -p 9000:9000 tomoncle/triproxy -listen :9000
+```
+
+> Full Docker guide (docker-compose, tags, platforms): [DOCKERHUB.md](DOCKERHUB.md)
+
 ## Configuration reference
 
 The config file is YAML (JSON also works, since JSON is valid YAML). `listen` defaults to `:8866`.
