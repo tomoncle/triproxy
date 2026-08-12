@@ -201,6 +201,86 @@ data: {"type":"message_stop"}
 	}
 }
 
+// TestChatEncoderStandardWireFormat locks in the OpenAI-compatible wire format
+// for the chat encoder: finish_reason must sit on choices[0].finish_reason
+// (not inside delta), and a usage-only trailing chunk must precede [DONE] when
+// usage is available. Strict OpenAI consumers (new-api's OpenAI channel) rely
+// on both to finalize a stream — without them Claude Code reports an
+// interrupted conversation.
+func TestChatEncoderStandardWireFormat(t *testing.T) {
+	src := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+`
+	out := encodeStream(t, ProtoOpenAIChat, parseEvents(t, ProtoAnthropicMessages, src))
+
+	type choice struct {
+		Delta        map[string]any `json:"delta"`
+		FinishReason any            `json:"finish_reason"`
+	}
+	type chunk struct {
+		Choices []choice       `json:"choices"`
+		Usage   map[string]any `json:"usage"`
+	}
+
+	var sawFinishReasonChunk, sawUsageChunk bool
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+			continue
+		}
+		var c chunk
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &c); err != nil {
+			continue
+		}
+		if len(c.Choices) == 0 {
+			// usage-only trailing chunk
+			if c.Usage != nil {
+				sawUsageChunk = true
+				if c.Usage["total_tokens"] != float64(3) {
+					t.Fatalf("usage chunk tokens = %v (want 3)", c.Usage["total_tokens"])
+				}
+			}
+			continue
+		}
+		if c.Choices[0].FinishReason != nil {
+			sawFinishReasonChunk = true
+			if fr, _ := c.Choices[0].FinishReason.(string); fr != "stop" {
+				t.Fatalf("finish_reason = %v (want stop)", c.Choices[0].FinishReason)
+			}
+			if len(c.Choices[0].Delta) != 0 {
+				t.Fatalf("terminal chunk delta must be empty, got %v", c.Choices[0].Delta)
+			}
+		}
+		if _, insideDelta := c.Choices[0].Delta["finish_reason"]; insideDelta {
+			t.Fatalf("finish_reason must NOT be inside delta (new-api reads choices[0].finish_reason): %s", line)
+		}
+	}
+	if !sawFinishReasonChunk {
+		t.Fatalf("no terminal finish_reason chunk emitted\n%s", out)
+	}
+	if !sawUsageChunk {
+		t.Fatalf("no usage-only trailing chunk emitted\n%s", out)
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("missing [DONE]\n%s", out)
+	}
+}
+
 func TestMessagesStreamToolUseToChatStream(t *testing.T) {
 	src := `event: message_start
 data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[]}}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -389,39 +390,44 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, aliasName string,
 			p.debugStage(reqID, "triproxy 响应客户端：", "响应头：", "响应体：",
 				append([]string{strconv.Itoa(upResp.StatusCode)}, debugHeaderLines(w.Header())...), nil)
 		}
-		if p.cfg.Debug && strings.Contains(upResp.Header.Get("Content-Type"), "text/event-stream") {
-			// 透传流式：不缓冲，但边转发边解析出内容汇总，让 debug 也能看到
-			// 上游模型实际返回的文本/工具调用。
-			dbg := newStreamDebugger(reqID, true)
-			pr, pw := io.Pipe()
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				_ = parseUpstreamStream(upstreamProto, pr, func(ev streamEv) error {
-					dbg.observe(ev)
-					return nil
-				})
-				dbg.flush()
-			}()
-			mw := io.MultiWriter(w, pw)
-			buf := make([]byte, 32*1024)
-			for {
-				n, rerr := upResp.Body.Read(buf)
-				if n > 0 {
-					_, _ = mw.Write(buf[:n])
-					if f, ok := w.(http.Flusher); ok {
-						f.Flush()
-					}
-				}
-				if rerr == io.EOF {
-					break
-				}
-				if rerr != nil {
-					break
-				}
+		if strings.Contains(upResp.Header.Get("Content-Type"), "text/event-stream") {
+			// 透传流式：不缓冲，逐行转发并 Flush。chat 流额外保证标准收尾
+			// （见 relayChatStream）。debug 模式下边转发边解析出内容汇总，
+			// 让日志也能看到上游模型实际返回的文本/工具调用。
+			var mirror io.Writer
+			var done chan struct{}
+			if p.cfg.Debug {
+				dbg := newStreamDebugger(reqID, true)
+				pr, pw := io.Pipe()
+				mirror = pw
+				done = make(chan struct{})
+				go func() {
+					defer func() {
+						_ = pr.Close()
+						close(done)
+					}()
+					_ = parseUpstreamStream(upstreamProto, pr, func(ev streamEv) error {
+						dbg.observe(ev)
+						return nil
+					})
+					dbg.flush()
+				}()
 			}
-			_ = pw.Close()
-			<-done
+			var rerr error
+			if clientProto == ProtoOpenAIChat {
+				rerr = relayChatStream(w, upResp.Body, mirror)
+			} else if mirror != nil {
+				_, rerr = copyStream(io.MultiWriter(w, mirror), upResp.Body)
+			} else {
+				_, rerr = copyStream(w, upResp.Body)
+			}
+			if mirror != nil {
+				_ = mirror.(*io.PipeWriter).Close()
+				<-done
+			}
+			if rerr != nil && r.Context().Err() == nil {
+				log.Printf("streaming error (alias=%s): %v", clientProto, rerr)
+			}
 		} else {
 			_, _ = copyStream(w, upResp.Body)
 		}
@@ -561,7 +567,7 @@ func (p *Proxy) streamConvert(w http.ResponseWriter, r *http.Request, upResp *ht
 // io.Copy alone would let the response accumulate in Go's 4KB write buffer,
 // so SSE data would only reach the client in 4KB bursts (or not at all until
 // the stream ends), which reads as "stuck" in streaming clients.
-func copyStream(w http.ResponseWriter, r io.Reader) (int64, error) {
+func copyStream(w io.Writer, r io.Reader) (int64, error) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	var total int64
@@ -581,6 +587,76 @@ func copyStream(w http.ResponseWriter, r io.Reader) (int64, error) {
 		}
 		if err != nil {
 			return total, err
+		}
+	}
+}
+
+// relayChatStream relays an OpenAI chat SSE stream to the client line by line,
+// flushing after every line to keep streaming latency low.
+//
+// Strict OpenAI consumers (notably new-api's OpenAI channel, which re-emits
+// the upstream chat stream as Anthropic for Claude Code) only finalize a
+// stream when they see a usage-only trailing chunk (choices:[], usage:{...}),
+// which providers send only when the request carries
+// stream_options.include_usage. When the provider does not honor that option
+// the terminal Anthropic message_delta/message_stop is never emitted and the
+// client reports an interrupted conversation. To stay compatible regardless of
+// the provider, when the upstream stream reaches [DONE] without having
+// delivered a usage-only chunk, a synthesized one is injected first.
+//
+// mirror, when non-nil, receives the upstream's original lines (without the
+// injection) for debug parsing.
+func relayChatStream(w io.Writer, r io.Reader, mirror io.Writer) error {
+	flusher, _ := w.(http.Flusher)
+	br := bufio.NewReader(r)
+	seenUsage := false
+	for {
+		line, err := br.ReadString('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimSpace(line)
+			payload := ""
+			if strings.HasPrefix(trimmed, "data:") {
+				payload = strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			}
+			if payload == "[DONE]" && !seenUsage {
+				if werr := writeSSE(w, "", map[string]any{
+					"choices": []any{},
+					"usage": map[string]any{
+						"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+					},
+				}); werr != nil {
+					return werr
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			} else if payload != "" && payload != "[DONE]" {
+				var chunk struct {
+					Choices []any           `json:"choices"`
+					Usage   json.RawMessage `json:"usage"`
+				}
+				if json.Unmarshal([]byte(payload), &chunk) == nil &&
+					len(chunk.Choices) == 0 && len(chunk.Usage) > 0 {
+					seenUsage = true
+				}
+			}
+			if _, werr := io.WriteString(w, line); werr != nil {
+				return werr
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if mirror != nil {
+				// 调试镜像只是"顺带"解析汇总，绝不能因为镜像管道出错/卡住
+				// 而中断给客户端的转发。
+				_, _ = io.WriteString(mirror, line)
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
 		}
 	}
 }

@@ -675,6 +675,109 @@ func TestProxySameProtocolPassthrough(t *testing.T) {
 	}
 }
 
+// TestRelayChatStreamInjectsMissingUsage covers the new-api OpenAI-channel
+// compatibility: a chat SSE stream that ends with [DONE] but never delivered a
+// usage-only trailing chunk must have one injected before [DONE]; a stream
+// that already carries one must be relayed unchanged.
+func TestRelayChatStreamInjectsMissingUsage(t *testing.T) {
+	base := `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+`
+
+	t.Run("missing usage chunk is injected", func(t *testing.T) {
+		src := base + "data: [DONE]\n\n"
+		var out bytes.Buffer
+		if err := relayChatStream(&out, strings.NewReader(src), nil); err != nil {
+			t.Fatalf("relay error: %v", err)
+		}
+		got := out.String()
+		if !strings.Contains(got, `"choices":[]`) && !strings.Contains(got, `"choices": []`) {
+			t.Fatalf("usage chunk not injected\n%s", got)
+		}
+		if !strings.Contains(got, `"usage"`) {
+			t.Fatalf("injected chunk missing usage\n%s", got)
+		}
+		doneIdx := strings.Index(got, "data: [DONE]")
+		usageIdx := strings.Index(got, `"usage"`)
+		if doneIdx < usageIdx {
+			t.Fatalf("usage chunk must precede [DONE]\n%s", got)
+		}
+		// original chunks must be preserved verbatim
+		if !strings.Contains(got, `"content":"hi"`) {
+			t.Fatalf("original chunk lost\n%s", got)
+		}
+		if !strings.Contains(got, `"finish_reason":"stop"`) {
+			t.Fatalf("original finish_reason lost\n%s", got)
+		}
+	})
+
+	t.Run("existing usage chunk is preserved and not duplicated", func(t *testing.T) {
+		src := base +
+			`data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n" +
+			"data: [DONE]\n\n"
+		var out bytes.Buffer
+		if err := relayChatStream(&out, strings.NewReader(src), nil); err != nil {
+			t.Fatalf("relay error: %v", err)
+		}
+		got := out.String()
+		if !strings.Contains(got, `"total_tokens":2`) {
+			t.Fatalf("upstream usage chunk not preserved\n%s", got)
+		}
+		if strings.Contains(got, `"total_tokens":0`) {
+			t.Fatalf("spurious injected usage chunk\n%s", got)
+		}
+		if got != src {
+			t.Fatalf("stream with usage chunk must be relayed byte-identical\n--- got ---\n%s", got)
+		}
+	})
+}
+
+// TestProxyChatPassthroughInjectsUsageForStrictClient reproduces the user's
+// new-api OpenAI-channel scenario end to end: a chat upstream that does NOT
+// honor stream_options.include_usage (no usage trailing chunk) feeding a strict
+// OpenAI consumer. triproxy must inject the usage chunk before [DONE] so the
+// consumer can finalize the stream.
+func TestProxyChatPassthroughInjectsUsageForStrictClient(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer up.Close()
+
+	proxy := startProxy(t, up.URL, ProtoOpenAIChat)
+	resp := doRequest(t, "POST", proxy.URL+"/llm/v1/chat/completions", "Bearer sk", `{
+		"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}],"stream":true
+	}`)
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+
+	if !strings.Contains(string(out), `"choices":[]`) && !strings.Contains(string(out), `"choices": []`) {
+		t.Fatalf("usage chunk not injected through proxy\n%s", out)
+	}
+	if !strings.Contains(string(out), `"usage"`) {
+		t.Fatalf("injected chunk missing usage\n%s", out)
+	}
+	doneIdx := strings.Index(string(out), "data: [DONE]")
+	usageIdx := strings.Index(string(out), `"usage"`)
+	if doneIdx < usageIdx {
+		t.Fatalf("usage chunk must precede [DONE]\n%s", out)
+	}
+	if !strings.Contains(string(out), `"finish_reason":"stop"`) {
+		t.Fatalf("original finish_reason lost\n%s", out)
+	}
+}
+
 func TestProxyModelsPassthrough(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {

@@ -438,7 +438,20 @@ func (e *chatEncoder) Write(ev streamEv) error {
 			e.started = true
 		}
 		e.done = true
-		return e.chunk(map[string]any{"finish_reason": finishReasonToChat(ev.finishReason)})
+		if err := e.finishChunk(finishReasonToChat(ev.finishReason)); err != nil {
+			return err
+		}
+		if ev.usage != nil {
+			// OpenAI streams usage in a trailing choices:[] chunk when the
+			// client requests stream_options.include_usage. Strict OpenAI
+			// consumers (e.g. new-api's OpenAI channel, which re-emits the
+			// stream as Anthropic for Claude Code) rely on this chunk to emit
+			// the terminal message_delta/message_stop; without it the client
+			// never sees the message finalized and reports an interrupted
+			// conversation.
+			return e.usageChunk(ev.usage)
+		}
+		return nil
 	}
 	return nil
 }
@@ -450,6 +463,44 @@ func (e *chatEncoder) chunk(delta map[string]any) error {
 		"created": e.created,
 		"model":   e.model,
 		"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}},
+	}
+	return writeSSE(e.w, "", payload)
+}
+
+// finishChunk emits the terminal chunk with finish_reason on the choice
+// (choices[0].finish_reason) and an empty delta, matching the OpenAI / DeepSeek
+// wire format. Consumers read finish_reason from the choice, not from delta.
+func (e *chatEncoder) finishChunk(reason any) error {
+	payload := map[string]any{
+		"id":      e.id,
+		"object":  "chat.completion.chunk",
+		"created": e.created,
+		"model":   e.model,
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": reason}},
+	}
+	return writeSSE(e.w, "", payload)
+}
+
+// usageChunk emits the usage-only trailing chunk OpenAI sends with
+// stream_options.include_usage, so strict consumers can finalize the stream.
+func (e *chatEncoder) usageChunk(u *Usage) error {
+	total := u.TotalTokens
+	if total == 0 && (u.InputTokens > 0 || u.OutputTokens > 0) {
+		// Anthropic sources do not report a combined total; OpenAI defines
+		// total_tokens = prompt_tokens + completion_tokens, so compute it.
+		total = u.InputTokens + u.OutputTokens
+	}
+	payload := map[string]any{
+		"id":      e.id,
+		"object":  "chat.completion.chunk",
+		"created": e.created,
+		"model":   e.model,
+		"choices": []any{},
+		"usage": map[string]any{
+			"prompt_tokens":     u.InputTokens,
+			"completion_tokens": u.OutputTokens,
+			"total_tokens":      total,
+		},
 	}
 	return writeSSE(e.w, "", payload)
 }
