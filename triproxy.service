@@ -1,0 +1,49 @@
+[Unit]
+Description=triproxy - multi-protocol LLM API proxy (Chat / Responses / Messages)
+# 上面一行 Documentation= 可改成你的项目地址（可选）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 建议用专用系统用户运行，避免以 root 运行。
+# 创建方法：sudo useradd -r -s /usr/sbin/nologin triproxy
+User=triproxy
+Group=triproxy
+
+# 二进制在 /usr/local/bin/triproxy，配置在 /etc/triproxy/config.yaml
+ExecStart=/usr/local/bin/triproxy -config /etc/triproxy/config.yaml
+
+# 崩溃自动重启
+Restart=on-failure
+RestartSec=3
+
+# 日志输出到 journald（查看：journalctl -u triproxy -f）
+StandardOutput=journal
+StandardError=journal
+
+# 系统资源上限（可选）
+LimitNOFILE=65535
+
+# Go 运行时内存调优（推荐默认值，可按需调整）：
+#   GOMEMLIMIT 是堆内存软上限，超过后 Go 会主动归还内存给系统；
+#   GOGC=50 让 GC 更勤快，压低内存峰值（代价是略多 CPU）。
+Environment=GOMEMLIMIT=256MiB
+Environment=GOGC=50
+
+# ---- 安全加固（可选，按需增删）----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+# 代理只出站访问上游、入站监听 8866，用不到其他地址族
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

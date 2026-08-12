@@ -1,0 +1,151 @@
+# ============================================================================
+# triproxy GitHub Actions CI/CD
+#   test    - 单元测试 + go vet
+#   build   - 交叉编译 5 个平台二进制，上传 artifact
+#   release - 打 tag 时把二进制发布到 GitHub Releases（用户可直接下载）
+#   docker  - 构建并推送 Docker 镜像 tomoncle/triproxy:{tag}
+#
+# 需要的 Secrets（Settings -> Secrets and variables -> Actions）：
+#   DOCKER_USER / DOCKER_PASSWORD   推送 Docker Hub tomoncle/triproxy
+#   推阿里云等私有仓库：另设 REGISTRY（如 registry.cn-beijing.aliyuncs.com），
+#   镜像地址将变为 {REGISTRY}/tomoncle/triproxy:{tag}
+# ============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.25"
+
+# 发布 Release 需要写权限；部分仓库/组织的 GITHUB_TOKEN 默认只读，显式声明保证发布可用
+permissions:
+  contents: write
+
+jobs:
+  # ---------- 测试 ----------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Test
+        run: go test -count=1 ./...
+      - name: Vet
+        run: go vet ./...
+
+  # ---------- 构建（全平台二进制） ----------
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Cross compile
+        run: |
+          set -e
+          mkdir -p dist
+          for p in linux/amd64 linux/arm64 linux/386 linux/arm linux/riscv64 \
+                   linux/loong64 linux/ppc64le linux/s390x \
+                   darwin/amd64 darwin/arm64 \
+                   windows/amd64 windows/arm64 windows/386 \
+                   freebsd/amd64 freebsd/arm64; do
+            os=${p%/*}; arch=${p#*/}; name=triproxy-$os-$arch
+            if [ "$os" = "windows" ]; then name=$name.exe; fi
+            echo "==> triproxy $p"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o dist/$name .
+          done
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: triproxy-binaries
+          path: dist/
+          if-no-files-found: error
+
+  # ---------- 发布（打 tag 时，发布二进制到 GitHub Releases） ----------
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: triproxy-binaries
+          path: dist/
+      - name: Prepare install assets
+        run: cp config.example.yaml config.yaml
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            install.sh
+            config.yaml
+            triproxy.service
+            dist/triproxy-linux-amd64
+            dist/triproxy-linux-arm64
+            dist/triproxy-linux-386
+            dist/triproxy-linux-arm
+            dist/triproxy-linux-riscv64
+            dist/triproxy-linux-loong64
+            dist/triproxy-linux-ppc64le
+            dist/triproxy-linux-s390x
+            dist/triproxy-darwin-amd64
+            dist/triproxy-darwin-arm64
+            dist/triproxy-windows-amd64.exe
+            dist/triproxy-windows-arm64.exe
+            dist/triproxy-windows-386.exe
+            dist/triproxy-freebsd-amd64
+            dist/triproxy-freebsd-arm64
+          generate_release_notes: true
+
+  # ---------- Docker 镜像（推送 tomoncle/triproxy:{tag}） ----------
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Compute image tags
+        id: meta
+        run: |
+          REG="${REGISTRY%/}"
+          IMG="${REG:+$REG/}tomoncle/triproxy"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # 打 tag 时同时更新 latest，对齐最新版本号
+            echo "tags=${IMG}:${{ github.ref_name }},${IMG}:latest" >> "$GITHUB_OUTPUT"
+          else
+            # main 分支只推 commit sha，不覆盖 latest
+            echo "tags=${IMG}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/ppc64le,linux/s390x,linux/riscv64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

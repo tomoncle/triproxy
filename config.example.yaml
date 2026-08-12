@@ -1,0 +1,172 @@
+# ============================================================================
+# triproxy 完整参考配置（config.example.yaml）
+# ----------------------------------------------------------------------------
+# 这是"所有字段 + 所有类型 + 所有示例"的一份完整清单。直接复制改即可用：
+#   1. 复制为 config.yaml
+#   2. 把每个 alias 的 upstream 换成你的真实地址
+#   3. 按需打开注释掉的字段
+#
+# 服务暴露地址：  http://localhost:8866/{alias}/v1/{chat/completions|responses|messages|models}
+# 监听地址：      默认 :8866，可用 -listen 覆盖
+# 配置文件：      YAML 或 JSON（JSON 是合法 YAML，两者都支持）
+#
+# 客户端协议由"调用哪个路径"决定（客户端决定），上游协议由 alias.protocol 决定：
+#   POST /{alias}/v1/chat/completions  -> 客户端是 OpenAI Chat Completions（OpenAI SDK / 各种 Chat 客户端）
+#   POST /{alias}/v1/responses         -> 客户端是 OpenAI Responses（Codex CLI）
+#   POST /{alias}/v1/messages          -> 客户端是 Anthropic Messages（Claude Code）
+#   GET  /{alias}/v1/models            -> 透传，不转换
+#
+# 上游协议类型（alias.protocol 取值）：
+#   openai-chat         -> 上游说 OpenAI Chat Completions（POST /v1/chat/completions）
+#   openai-responses    -> 上游说 OpenAI Responses（POST /v1/responses，Codex 原生协议）
+#   anthropic-messages  -> 上游说 Anthropic Messages（POST /v1/messages，Claude 原生协议）
+# 兼容短名：chat / responses / messages（自动归一化为上面的规范名）。
+# 协议相同时透传（不转换，保留所有字段）；不同时双向转换（请求体 + 响应体 + SSE 流式）。
+# 客户端传来的 API Key（Authorization / x-api-key）原样透传给上游，不做任何处理。
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 顶层字段
+# ----------------------------------------------------------------------------
+listen: ":8866"          # 监听地址（默认 :8866），可用命令行 -listen 覆盖
+
+# debug: true             # 可选（bool）。打印每次上游请求的 URL 和全部请求头，
+#                         # 密钥（Authorization / x-api-key）自动打码为 [REDACTED]。
+#                         # 用于排查"伪装头有没有真正发给上游"等问题。默认关。
+
+# proxy: "http://127.0.0.1:7890"    # 可选。全局默认上游代理，所有未单独配置 proxy 的
+#                                   # alias 生效。支持 http / https / socks5 / socks5h。
+# proxy: "socks5://127.0.0.1:1080"  # （URL 可带账号密码 http://user:pass@host:port）
+
+# ----------------------------------------------------------------------------
+# aliases（必填，至少一个）
+# ----------------------------------------------------------------------------
+aliases:
+  # ==========================================================================
+  # 例 1：上游是 OpenAI Chat Completions（protocol: openai-chat）
+  #   Codex 客户端 -> 只支持 Chat Completions 的上游
+  #   POST http://localhost:8866/chat/v1/responses
+  #     -> https://chat.llm.com/v1/chat/completions   (openai-responses -> openai-chat)
+  # ==========================================================================
+  chat:
+    upstream: "https://chat.llm.com"     # 必填。上游 base URL（可带路径）
+    protocol: openai-chat                # 可选，默认 openai-chat；可写短名 "chat"
+    max_concurrency: 4                   # 可选。同一 alias 同时打到上游的最大请求数
+    concurrency_mode: reject             # 可选。reject(默认) 超限立即 429 | queue 排队等待
+    # path: "/v1/custom/completions"     # 可选。覆盖上游端点路径（默认按协议取标准路径）
+    # thinking: true                     # 可选。对本 alias 无实际意义（Chat 无 thinking），仅示例
+    # headers:                           # 可选。自定义请求头，最后应用、优先级最高
+    #   User-Agent: "custom-agent/1.0"
+    # proxy: "http://127.0.0.1:7890"     # 可选。只对本 alias 生效，覆盖全局 proxy
+
+  # ==========================================================================
+  # 例 2：上游是 OpenAI Responses（protocol: openai-responses，Codex 原生协议）
+  #   任意客户端 -> 支持 Responses 的上游
+  #   POST http://localhost:8866/openai/v1/chat/completions   (openai-chat -> openai-responses)
+  #   POST http://localhost:8866/openai/v1/messages           (anthropic-messages -> openai-responses)
+  # ==========================================================================
+  openai:
+    upstream: "https://api.responses.com"
+    protocol: openai-responses           # 可写短名 "responses"
+    max_concurrency: 4
+    concurrency_mode: reject
+    # 可选：自定义请求头，这里演示伪装成 Codex 客户端（某些上游/中转只认官方 Codex UA）。
+    # 会自动剥掉 Anthropic 专属头、补协议必需行为（如 x-api-key -> Authorization），
+    # 自定义头最后应用、优先级最高。
+    headers:
+      User-Agent: "codex_cli_rs/0.139.0 (Linux 6.5.0; x86_64)"
+
+  # ==========================================================================
+  # 例 3：上游是 Anthropic Messages（protocol: anthropic-messages，Claude 原生协议）
+  #   Codex 客户端 -> Anthropic Messages 上游（把 Codex 的 Responses 请求转成 Claude 协议）
+  #   POST http://localhost:8866/anthropic/v1/responses
+  #     -> https://api.opencode.com/v1/messages           (openai-responses -> anthropic-messages)
+  # ==========================================================================
+  anthropic:
+    upstream: "http://api.opencode.com"
+    protocol: anthropic-messages         # 可写短名 "messages"
+    max_concurrency: 4
+    concurrency_mode: reject
+    # 可选：开启 Anthropic extended thinking 桥接（默认 false）。
+    # 开启后：把 Codex 的 reasoning 请求转成 thinking 参数 + thinking-2024-12-04 beta 头，
+    # 并把上游 thinking 块转回 Responses reasoning item 返回给 Codex（含流式）。
+    # 要求上游支持 extended thinking；官方 Anthropic API 对 thinking 签名校验严格，
+    # 若收到 400 请关闭此项（关闭后仍保留 thinking→reasoning 的摘要级转换）。
+    thinking: true
+    # 可选：自定义请求头，这里演示伪装成 Claude Code 客户端。
+    # 注意：若在此设置 anthropic-beta，会覆盖自动注入的 thinking-2024-12-04 头，
+    # 导致上面的 thinking: true 不生效（用户自定义头优先级最高）。
+    headers:
+      User-Agent: "claude-cli/2.1.221 (external, cli)"
+      x-app: "cli"
+      # anthropic-beta: "claude-code-20250219"   # 想伪装成 Claude Code 时打开；
+      #                                          # 打开后 thinking: true 不生效
+    # proxy: "http://127.0.0.1:7890"    # 可选：只对本 alias 生效的代理（覆盖全局）
+
+  # ==========================================================================
+  # 例 4：简写字符串形式（只填 upstream，协议从 URL 路径推断，识别不出时默认 openai-chat）
+  # ==========================================================================
+  # claude:
+  #   "https://api.anthropic.com/v1/messages"     # 路径含 /v1/messages -> anthropic-messages
+  # codex:
+  #   "https://api.openai.com/v1/responses"       # 路径含 /v1/responses -> openai-responses
+  # local:
+  #   "http://127.0.0.1:1234/v1"                  # 识别不出 -> openai-chat
+
+  # ==========================================================================
+  # 例 5：自定义上游路径（path 覆盖默认端点路径）
+  # ==========================================================================
+  # custom:
+  #   upstream: "http://127.0.0.1:1234"
+  #   protocol: openai-chat
+  #   path: "/v1/custom/completions"              # 覆盖默认 /v1/chat/completions
+
+  # ==========================================================================
+  # 例 6：并发限制用 queue 模式（排队等待空闲槽位，客户端断开自动取消）
+  # ==========================================================================
+  # queued:
+  #   upstream: "https://chat.llm.com"
+  #   protocol: openai-chat
+  #   max_concurrency: 2
+  #   concurrency_mode: queue
+
+  # ==========================================================================
+  # 例 7：无并发限制 + 全字段打开（最完整写法）
+  # ==========================================================================
+  # full:
+  #   upstream: "https://chat.llm.com"      # 必填
+  #   protocol: openai-chat                 # 可选，默认 openai-chat
+  #   path: "/v1/chat/completions"          # 可选，默认按协议取标准路径
+  #   max_concurrency: 4                    # 可选，默认 0（不限制）
+  #   concurrency_mode: reject              # 可选，默认 reject
+  #   headers:                              # 可选，默认空
+  #     User-Agent: "my-client/1.0"
+  #   thinking: false                       # 可选，默认 false
+  #   proxy: "http://127.0.0.1:7890"        # 可选，默认空（用全局或直连）
+
+# ============================================================================
+# 字段速查表
+# ----------------------------------------------------------------------------
+# 顶层：
+#   listen   (string, 默认 ":8866")        监听地址
+#   debug    (bool,   默认 false)          打印上游请求日志（密钥打码）
+#   proxy    (string, 默认 "")             全局默认上游代理 (http/https/socks5/socks5h)
+#
+# aliases.<name>：
+#   upstream           (string, 必填)      上游 base URL（可带路径）
+#   protocol           (string, 默认 "openai-chat")  上游协议：openai-chat / openai-responses /
+#                        anthropic-messages（短名 chat / responses / messages）
+#   path               (string, 默认按协议) 覆盖上游端点路径
+#   max_concurrency    (int,   默认 0=不限) 同 alias 并发上限
+#   concurrency_mode   (string, 默认 "reject")  reject=超限立即 429 | queue=排队
+#   headers            (map,   默认空)     自定义请求头，最后应用、优先级最高
+#   thinking           (bool,  默认 false) 开启 Anthropic extended thinking 桥接
+#   proxy              (string, 默认 "")   本 alias 的上游代理，覆盖全局 proxy
+#
+# 客户端路径（决定客户端协议）：
+#   /{alias}/v1/chat/completions  openai-chat
+#   /{alias}/v1/responses         openai-responses
+#   /{alias}/v1/messages          anthropic-messages
+#   /{alias}/v1/models            透传
+#   /{alias}/v1/responses/compact 仅 openai-responses 上游支持（其他返回 501）
+# ============================================================================

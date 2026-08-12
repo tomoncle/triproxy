@@ -1,0 +1,7 @@
+.git
+dist/
+triproxy
+logs/
+.idea/
+*.test
+*.out
