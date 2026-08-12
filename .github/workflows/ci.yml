@@ -5,8 +5,13 @@
 #   release - 打 tag 时把二进制发布到 GitHub Releases（用户可直接下载）
 #   docker  - 构建并推送 Docker 镜像 tomoncle/triproxy:{tag}
 #
+# 触发策略：任意分支 push 只跑 test；PR 跑 test + build 做验证；
+# 打 v* tag 时跑完整流水线（test + build + release + docker）。
+#
 # 需要的 Secrets（Settings -> Secrets and variables -> Actions）：
 #   DOCKER_USER / DOCKER_PASSWORD   推送 Docker Hub tomoncle/triproxy
+#   GITHUB_TOKEN                    推送 GHCR（ghcr.io/tomoncle/triproxy），
+#                                   无需额外配置，Actions 自动提供
 #   推阿里云等私有仓库：另设 REGISTRY（如 registry.cn-beijing.aliyuncs.com），
 #   镜像地址将变为 {REGISTRY}/tomoncle/triproxy:{tag}
 # ============================================================================
@@ -15,17 +20,33 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # 放开到所有分支：任意分支 push 都触发（build/release/docker 仍按各自 if 门控）。
+    # 若只想 main 触发，取消下面这行注释并删除上面的说明。
+    # branches: [main]
     tags: ["v*"]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - ".github/**"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - ".github/**"
 
 env:
   GO_VERSION: "1.25"
 
+# 同一分支/PR 的连续提交只保留最新一次运行，避免排队堆积
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 # 发布 Release 需要写权限；部分仓库/组织的 GITHUB_TOKEN 默认只读，显式声明保证发布可用
 permissions:
   contents: write
+  packages: write
 
 jobs:
   # ---------- 测试 ----------
@@ -45,6 +66,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: test
+    # main 分支 push 只跑 test；交叉编译在 PR（验证）和打 tag（发布）时执行
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -109,11 +132,12 @@ jobs:
             dist/triproxy-freebsd-arm64
           generate_release_notes: true
 
-  # ---------- Docker 镜像（推送 tomoncle/triproxy:{tag}） ----------
+  # ---------- Docker 镜像（打 tag 时推送 Docker Hub + GHCR） ----------
   docker:
     runs-on: ubuntu-latest
     needs: test
-    if: github.event_name == 'push'
+    # 只在打 tag 时构建并推送 Docker 镜像，避免每个 commit 都推镜像
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
       - name: Set up QEMU
@@ -126,18 +150,20 @@ jobs:
           registry: ${{ secrets.REGISTRY }}
           username: ${{ secrets.DOCKER_USER }}
           password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Login to GHCR (GitHub Packages)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Compute image tags
         id: meta
         run: |
           REG="${REGISTRY%/}"
-          IMG="${REG:+$REG/}tomoncle/triproxy"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            # 打 tag 时同时更新 latest，对齐最新版本号
-            echo "tags=${IMG}:${{ github.ref_name }},${IMG}:latest" >> "$GITHUB_OUTPUT"
-          else
-            # main 分支只推 commit sha，不覆盖 latest
-            echo "tags=${IMG}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          fi
+          HUB_IMG="${REG:+$REG/}tomoncle/triproxy"
+          GHCR_IMG="ghcr.io/tomoncle/triproxy"
+          # docker job 仅在打 tag 时触发：Docker Hub 与 GHCR 各推 {tag} + latest
+          echo "tags=${HUB_IMG}:${{ github.ref_name }},${HUB_IMG}:latest,${GHCR_IMG}:${{ github.ref_name }},${GHCR_IMG}:latest" >> "$GITHUB_OUTPUT"
         env:
           REGISTRY: ${{ secrets.REGISTRY }}
       - name: Build and push (multi-arch)
